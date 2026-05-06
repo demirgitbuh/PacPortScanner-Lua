@@ -4,7 +4,6 @@
 
 ## Run
 
-Lua is not currently installed on this machine. After installing Lua:
 
 ```powershell
 lua pacportscanner.lua
