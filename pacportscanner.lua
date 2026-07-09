@@ -40,6 +40,46 @@ end
 
 local socket = try_require("socket")
 local unpack_table = table.unpack or unpack
+local base64_chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+
+local function base64_encode(data)
+  local out = {}
+  for i = 1, #data, 3 do
+    local a = data:byte(i) or 0
+    local b = data:byte(i + 1)
+    local c = data:byte(i + 2)
+    local n = a * 65536 + (b or 0) * 256 + (c or 0)
+    table.insert(out, base64_chars:sub(math.floor(n / 262144) % 64 + 1, math.floor(n / 262144) % 64 + 1))
+    table.insert(out, base64_chars:sub(math.floor(n / 4096) % 64 + 1, math.floor(n / 4096) % 64 + 1))
+    table.insert(out, b and base64_chars:sub(math.floor(n / 64) % 64 + 1, math.floor(n / 64) % 64 + 1) or "=")
+    table.insert(out, c and base64_chars:sub(n % 64 + 1, n % 64 + 1) or "=")
+  end
+  return table.concat(out)
+end
+
+local function utf16le_ascii(value)
+  local out = {}
+  for i = 1, #value do
+    table.insert(out, value:sub(i, i))
+    table.insert(out, "\0")
+  end
+  return table.concat(out)
+end
+
+local function run_powershell(script)
+  local cmd = "powershell -NoProfile -ExecutionPolicy Bypass -EncodedCommand " .. base64_encode(utf16le_ascii(script))
+  local pipe = io.popen(cmd)
+  if not pipe then return "" end
+  local output = pipe:read("*a") or ""
+  pipe:close()
+  return output
+end
+
+local function url_encode(value)
+  return tostring(value or ""):gsub("([^%w%-_%.~])", function(char)
+    return string.format("%%%02X", char:byte())
+  end)
+end
 
 local function split(value, sep)
   local out = {}
@@ -143,18 +183,14 @@ end
 
 local function powershell_connect(host, port, timeout)
   local ms = math.max(100, math.floor((timeout or 1) * 1000))
-  local cmd = table.concat({
-    "powershell -NoProfile -ExecutionPolicy Bypass -Command ",
-    "\"$c=New-Object Net.Sockets.TcpClient;",
+  local script = table.concat({
+    "$c=New-Object Net.Sockets.TcpClient;",
     "$iar=$c.BeginConnect(" .. ps_quote(host) .. "," .. tostring(port) .. ",$null,$null);",
     "$ok=$iar.AsyncWaitHandle.WaitOne(" .. tostring(ms) .. ",$false);",
     "if($ok -and $c.Connected){'open'}elseif($ok){'closed'}else{'filtered'};",
-    "$c.Close()\""
+    "$c.Close()"
   })
-  local pipe = io.popen(cmd)
-  if not pipe then return "filtered" end
-  local output = pipe:read("*a") or ""
-  pipe:close()
+  local output = run_powershell(script)
   return output:match("open") and "open" or output:match("closed") and "closed" or "filtered"
 end
 
@@ -185,12 +221,10 @@ end
 
 local function lookup_cves(service, version)
   if not service then return {} end
-  local query = (service .. " " .. (version or "")):gsub('"', "")
-  local cmd = "powershell -NoProfile -ExecutionPolicy Bypass -Command \"try { $r=Invoke-RestMethod -Uri 'https://services.nvd.nist.gov/rest/json/cves/2.0?keywordSearch=" .. query:gsub(" ", "%%20") .. "' -TimeoutSec 5; $r.vulnerabilities.cve.id | Select-Object -First 6 } catch {}\""
-  local pipe = io.popen(cmd)
-  if not pipe then return {} end
-  local output = pipe:read("*a") or ""
-  pipe:close()
+  local query = service .. " " .. (version or "")
+  local url = "https://services.nvd.nist.gov/rest/json/cves/2.0?keywordSearch=" .. url_encode(query)
+  local script = "try { $r=Invoke-RestMethod -Uri " .. ps_quote(url) .. " -TimeoutSec 5; $r.vulnerabilities.cve.id | Select-Object -First 6 } catch {}"
+  local output = run_powershell(script)
   local cves = {}
   for id in output:gmatch("CVE%-%d+%-%d+") do
     table.insert(cves, { id = id, severity = "UNKNOWN", source = "nvd", url = "https://nvd.nist.gov/vuln/detail/" .. id })
